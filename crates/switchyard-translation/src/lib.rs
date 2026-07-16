@@ -12,6 +12,7 @@ pub mod diagnostic;
 pub mod engine;
 pub mod error;
 pub mod policy;
+pub mod request_policy;
 pub mod stream;
 pub mod util;
 
@@ -23,6 +24,7 @@ pub use error::*;
 pub use format::*;
 pub use llm::*;
 pub use policy::*;
+pub use request_policy::*;
 pub use stream::*;
 pub use util::{
     normalize_anthropic_tool_use_ids, sanitize_anthropic_tool_use_id, PRESERVATION_METADATA_KEY,
