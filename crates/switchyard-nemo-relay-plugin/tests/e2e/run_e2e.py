@@ -1153,6 +1153,11 @@ def main() -> None:
         ],
         check=True,
     )
+    assert {path.name for path in bundle.iterdir()} == {
+        plugin_library.name,
+        "config.schema.json",
+        "relay-plugin.toml",
+    }
     relay_version = subprocess.run(
         [str(relay_bin), "--version"],
         check=True,
