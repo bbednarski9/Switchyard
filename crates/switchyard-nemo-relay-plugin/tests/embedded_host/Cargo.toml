@@ -1,0 +1,21 @@
+# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# SPDX-License-Identifier: Apache-2.0
+
+[package]
+name = "switchyard-nemo-relay-embedded-host-e2e"
+version = "0.0.0"
+edition = "2024"
+publish = false
+
+# Keep this harness independent from the enclosing Switchyard workspace. It
+# deliberately does not link switchyard-nemo-relay-plugin as an rlib; the test
+# loads only the packaged cdylib through Relay's public dynamic-plugin API.
+[workspace]
+
+[dependencies]
+# Match the published Relay host used by the process E2E. Move this to `0.7.0`
+# together with the plugin SDK dependency when the stable release is available.
+nemo-relay = { version = "=0.7.0-rc.4", default-features = false }
+opentelemetry_sdk = { version = "0.32.1", default-features = false, features = ["testing", "trace"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
