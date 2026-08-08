@@ -651,8 +651,15 @@ fn context_from_metadata(metadata: Option<&Metadata>) -> Context {
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use switchyard_libsy::{LlmTarget, Passthrough};
-    use switchyard_protocol::{LlmResponseStream, RoutedLlmClient};
+    use switchyard_libsy::{
+        ClassifierContractConfig, EscalationJudgeConfig, LlmClassifierConfig, LlmFallback,
+        LlmTarget, LlmTaskClassifier, Passthrough, PickerMode, StageRouter, StageRouterConfig,
+        TaskClassifierConfig,
+    };
+    use switchyard_protocol::{
+        ContentBlock, LlmRequest, LlmResponseStream, Message, Role, RoutedLlmClient, ToolCall,
+        ToolResult, text_request, text_response,
+    };
 
     use super::*;
 
@@ -669,6 +676,16 @@ mod tests {
     }
 
     struct BufferedClient {
+        calls: AtomicUsize,
+    }
+
+    enum FixedBehavior {
+        Text(&'static str),
+        TransportFailure,
+    }
+
+    struct FixedClient {
+        behavior: FixedBehavior,
         calls: AtomicUsize,
     }
 
@@ -714,6 +731,99 @@ mod tests {
                 llm_response: LlmResponse::Agg(Default::default()),
                 metadata: None,
             })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RoutedLlmClient for FixedClient {
+        async fn call(
+            &self,
+            _ctx: Context,
+            request: Request,
+            _decision: Arc<dyn Decision>,
+        ) -> Result<Response, LlmClientError> {
+            self.calls.fetch_add(1, Ordering::Relaxed);
+            match self.behavior {
+                FixedBehavior::Text(text) => Ok(Response {
+                    llm_response: LlmResponse::Agg(text_response(None, text)),
+                    metadata: request.metadata,
+                }),
+                FixedBehavior::TransportFailure => Err(LlmClientError::Transport {
+                    source: Box::new(std::io::Error::other("scripted failure")),
+                }),
+            }
+        }
+    }
+
+    fn fixed_target(name: &str, client: Arc<FixedClient>) -> LlmTarget {
+        LlmTarget {
+            semantic_name: name.to_string(),
+            llm_client: Some(client),
+        }
+    }
+
+    fn runtime_with_algorithm(
+        algorithm: Arc<dyn Algorithm>,
+        fallback: Arc<FixedClient>,
+        protocol: WireFormat,
+    ) -> SwitchyardRuntime {
+        SwitchyardRuntime {
+            max_retries: 0,
+            algorithm,
+            targets: BTreeMap::from([(
+                "fallback".into(),
+                PreparedTargetBinding { client: fallback },
+            )]),
+            default_targets: BTreeMap::from([(protocol, "fallback".into())]),
+            translation: TranslationEngine::default(),
+        }
+    }
+
+    fn request_with_session(protocol: WireFormat, session: Option<&str>) -> Request {
+        Request {
+            llm_request: text_request(Some("auto".into()), "fix the build"),
+            raw_request: None,
+            metadata: Some(Metadata {
+                wire_format: Some(protocol),
+                session_id: session.map(str::to_string),
+                ..Metadata::default()
+            }),
+        }
+    }
+
+    fn stage_signal_request(protocol: WireFormat) -> Request {
+        Request {
+            llm_request: LlmRequest {
+                model: Some("auto".into()),
+                messages: vec![
+                    Message::text(Role::User, "fix the build"),
+                    Message {
+                        role: Role::Assistant,
+                        content: vec![ContentBlock::ToolCall(ToolCall {
+                            id: "call-1".into(),
+                            name: "bash".into(),
+                            arguments: json!({"cmd": "cargo test"}),
+                        })],
+                    },
+                    Message {
+                        role: Role::Tool,
+                        content: vec![ContentBlock::ToolResult(ToolResult {
+                            tool_call_id: "call-1".into(),
+                            content: vec![ContentBlock::Text {
+                                text: "fatal runtime error: out of memory".into(),
+                            }],
+                            is_error: Some(true),
+                        })],
+                    },
+                ],
+                ..LlmRequest::default()
+            },
+            raw_request: None,
+            metadata: Some(Metadata {
+                wire_format: Some(protocol),
+                session_id: Some(format!("stage-{}", protocol.as_str())),
+                ..Metadata::default()
+            }),
         }
     }
 
@@ -913,6 +1023,340 @@ mod tests {
         assert_eq!(retry_backoff(3), Duration::from_secs(1));
         assert_eq!(retry_backoff(4), Duration::from_secs(2));
         assert_eq!(retry_backoff(u32::MAX), Duration::from_secs(2));
+    }
+
+    #[tokio::test]
+    async fn escalation_buffers_weak_stream_then_latches_the_session_to_strong() {
+        let weak = Arc::new(FixedClient {
+            behavior: FixedBehavior::Text("weak draft"),
+            calls: AtomicUsize::new(0),
+        });
+        let strong = Arc::new(FixedClient {
+            behavior: FixedBehavior::Text("strong answer"),
+            calls: AtomicUsize::new(0),
+        });
+        let judge = Arc::new(FixedClient {
+            behavior: FixedBehavior::Text(r#"{"escalate":true,"reason":"stuck"}"#),
+            calls: AtomicUsize::new(0),
+        });
+        let fallback = Arc::new(FixedClient {
+            behavior: FixedBehavior::Text("fallback"),
+            calls: AtomicUsize::new(0),
+        });
+        let algorithm = LlmTaskClassifier::new(LlmClassifierConfig::Escalation {
+            judge_target: fixed_target("judge", judge.clone()),
+            efficient_target: fixed_target("weak", weak.clone()),
+            capable_target: fixed_target("strong", strong.clone()),
+            contract: ClassifierContractConfig::default(),
+            config: EscalationJudgeConfig {
+                confirmations: 1,
+                ..EscalationJudgeConfig::default()
+            },
+            max_output_tokens: 128,
+        })
+        .unwrap();
+        let runtime = runtime_with_algorithm(
+            Arc::new(algorithm),
+            fallback.clone(),
+            WireFormat::OpenAiChat,
+        );
+
+        let mut first = request_with_session(WireFormat::OpenAiChat, Some("session-1"));
+        first.llm_request.stream = true;
+        let (output, messages) = async_channel::bounded(32);
+        runtime
+            .execute_stream(WireFormat::OpenAiChat, first, &output)
+            .await
+            .unwrap();
+        let mut streamed = Vec::new();
+        while let Ok(message) = messages.try_recv() {
+            if let StreamMessage::Event(event) = message {
+                streamed.push(event);
+            }
+        }
+        assert!(!streamed.is_empty());
+        assert!(
+            streamed
+                .iter()
+                .any(|event| event.to_string().contains("strong answer"))
+        );
+
+        let mut marks = Vec::new();
+        let response = runtime
+            .execute_buffered(
+                WireFormat::OpenAiChat,
+                request_with_session(WireFormat::OpenAiChat, Some("session-1")),
+                &mut marks,
+            )
+            .await
+            .unwrap();
+        assert!(response.to_string().contains("strong answer"));
+        assert_eq!(weak.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(judge.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(strong.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(fallback.calls.load(Ordering::Relaxed), 0);
+        assert!(marks.iter().any(|mark| {
+            mark.name == "switchyard.routing.decision"
+                && mark.data["selected_target"] == "strong"
+                && mark.data["routing_tier"] == "strong"
+                && mark.metadata["session_id"] == "session-1"
+        }));
+    }
+
+    #[tokio::test]
+    async fn escalation_judge_failure_falls_open_to_the_buffered_weak_response() {
+        let weak = Arc::new(FixedClient {
+            behavior: FixedBehavior::Text("weak answer"),
+            calls: AtomicUsize::new(0),
+        });
+        let strong = Arc::new(FixedClient {
+            behavior: FixedBehavior::Text("strong answer"),
+            calls: AtomicUsize::new(0),
+        });
+        let judge = Arc::new(FixedClient {
+            behavior: FixedBehavior::TransportFailure,
+            calls: AtomicUsize::new(0),
+        });
+        let fallback = Arc::new(FixedClient {
+            behavior: FixedBehavior::Text("fallback"),
+            calls: AtomicUsize::new(0),
+        });
+        let algorithm = LlmTaskClassifier::new(LlmClassifierConfig::Escalation {
+            judge_target: fixed_target("judge", judge.clone()),
+            efficient_target: fixed_target("weak", weak.clone()),
+            capable_target: fixed_target("strong", strong.clone()),
+            contract: ClassifierContractConfig::default(),
+            config: EscalationJudgeConfig::default(),
+            max_output_tokens: 128,
+        })
+        .unwrap();
+        let runtime = runtime_with_algorithm(
+            Arc::new(algorithm),
+            fallback.clone(),
+            WireFormat::OpenAiChat,
+        );
+        let mut marks = Vec::new();
+
+        let response = runtime
+            .execute_buffered(
+                WireFormat::OpenAiChat,
+                request_with_session(WireFormat::OpenAiChat, Some("session-1")),
+                &mut marks,
+            )
+            .await
+            .unwrap();
+
+        assert!(response.to_string().contains("weak answer"));
+        assert_eq!(weak.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(judge.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(strong.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fallback.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn escalation_without_session_identity_cannot_accumulate_confirmations() {
+        let weak = Arc::new(FixedClient {
+            behavior: FixedBehavior::Text("weak answer"),
+            calls: AtomicUsize::new(0),
+        });
+        let strong = Arc::new(FixedClient {
+            behavior: FixedBehavior::Text("strong answer"),
+            calls: AtomicUsize::new(0),
+        });
+        let judge = Arc::new(FixedClient {
+            behavior: FixedBehavior::Text(r#"{"escalate":true,"reason":"stuck"}"#),
+            calls: AtomicUsize::new(0),
+        });
+        let fallback = Arc::new(FixedClient {
+            behavior: FixedBehavior::Text("fallback"),
+            calls: AtomicUsize::new(0),
+        });
+        let algorithm = LlmTaskClassifier::new(LlmClassifierConfig::Escalation {
+            judge_target: fixed_target("judge", judge.clone()),
+            efficient_target: fixed_target("weak", weak.clone()),
+            capable_target: fixed_target("strong", strong.clone()),
+            contract: ClassifierContractConfig::default(),
+            config: EscalationJudgeConfig {
+                confirmations: 2,
+                ..EscalationJudgeConfig::default()
+            },
+            max_output_tokens: 128,
+        })
+        .unwrap();
+        let runtime = runtime_with_algorithm(
+            Arc::new(algorithm),
+            fallback.clone(),
+            WireFormat::OpenAiChat,
+        );
+
+        for _ in 0..2 {
+            let mut marks = Vec::new();
+            let response = runtime
+                .execute_buffered(
+                    WireFormat::OpenAiChat,
+                    request_with_session(WireFormat::OpenAiChat, None),
+                    &mut marks,
+                )
+                .await
+                .unwrap();
+            assert!(response.to_string().contains("weak answer"));
+        }
+        assert_eq!(weak.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(judge.calls.load(Ordering::Relaxed), 2);
+        assert_eq!(strong.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fallback.calls.load(Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn stage_router_uses_tool_signals_for_every_managed_protocol() {
+        for protocol in [
+            WireFormat::OpenAiChat,
+            WireFormat::OpenAiResponses,
+            WireFormat::AnthropicMessages,
+        ] {
+            let capable = Arc::new(FixedClient {
+                behavior: FixedBehavior::Text("capable answer"),
+                calls: AtomicUsize::new(0),
+            });
+            let efficient = Arc::new(FixedClient {
+                behavior: FixedBehavior::Text("efficient answer"),
+                calls: AtomicUsize::new(0),
+            });
+            let fallback = Arc::new(FixedClient {
+                behavior: FixedBehavior::Text("fallback"),
+                calls: AtomicUsize::new(0),
+            });
+            let algorithm = StageRouter::new(
+                fixed_target("strong", capable.clone()),
+                fixed_target("weak", efficient.clone()),
+                StageRouterConfig::new(PickerMode::EfficientFirst, 0.5),
+            )
+            .unwrap();
+            let runtime = runtime_with_algorithm(Arc::new(algorithm), fallback.clone(), protocol);
+            let mut marks = Vec::new();
+
+            let response = runtime
+                .execute_buffered(protocol, stage_signal_request(protocol), &mut marks)
+                .await
+                .unwrap();
+
+            assert!(response.to_string().contains("capable answer"));
+            assert_eq!(capable.calls.load(Ordering::Relaxed), 1);
+            assert_eq!(efficient.calls.load(Ordering::Relaxed), 0);
+            assert_eq!(fallback.calls.load(Ordering::Relaxed), 0);
+            assert!(marks.iter().any(|mark| {
+                mark.name == "switchyard.routing.decision"
+                    && mark.data["algorithm"] == "stage_router"
+                    && mark.data["selected_target"] == "strong"
+                    && mark.data["routing_tier"] == "strong"
+                    && mark.metadata["session_id"] == format!("stage-{}", protocol.as_str())
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn stage_router_falls_open_to_each_picker_default_without_tool_history() {
+        for (picker, expected) in [
+            (PickerMode::CapableFirst, "strong"),
+            (PickerMode::EfficientFirst, "weak"),
+        ] {
+            let capable = Arc::new(FixedClient {
+                behavior: FixedBehavior::Text("strong"),
+                calls: AtomicUsize::new(0),
+            });
+            let efficient = Arc::new(FixedClient {
+                behavior: FixedBehavior::Text("weak"),
+                calls: AtomicUsize::new(0),
+            });
+            let fallback = Arc::new(FixedClient {
+                behavior: FixedBehavior::Text("fallback"),
+                calls: AtomicUsize::new(0),
+            });
+            let algorithm = StageRouter::new(
+                fixed_target("strong", capable),
+                fixed_target("weak", efficient),
+                StageRouterConfig::new(picker, 0.5),
+            )
+            .unwrap();
+            let runtime =
+                runtime_with_algorithm(Arc::new(algorithm), fallback, WireFormat::OpenAiChat);
+            let mut marks = Vec::new();
+
+            runtime
+                .execute_buffered(
+                    WireFormat::OpenAiChat,
+                    request_with_session(WireFormat::OpenAiChat, None),
+                    &mut marks,
+                )
+                .await
+                .unwrap();
+
+            assert!(marks.iter().any(|mark| {
+                mark.name == "switchyard.routing.decision"
+                    && mark.data["selected_target"] == expected
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn stage_router_classifier_resolves_an_ambiguous_turn() {
+        let capable = Arc::new(FixedClient {
+            behavior: FixedBehavior::Text("strong"),
+            calls: AtomicUsize::new(0),
+        });
+        let efficient = Arc::new(FixedClient {
+            behavior: FixedBehavior::Text("weak"),
+            calls: AtomicUsize::new(0),
+        });
+        let judge = Arc::new(FixedClient {
+            behavior: FixedBehavior::Text(
+                r#"{"crux":"bounded","primary_rule":"SUP-1","capability_boundary":"supported","p_solve":0.9}"#,
+            ),
+            calls: AtomicUsize::new(0),
+        });
+        let fallback = Arc::new(FixedClient {
+            behavior: FixedBehavior::Text("fallback"),
+            calls: AtomicUsize::new(0),
+        });
+        let mut config = StageRouterConfig::new(PickerMode::CapableFirst, 0.5);
+        config.llm_fallback = Some(LlmFallback {
+            judge_target: fixed_target("judge", judge.clone()),
+            config: TaskClassifierConfig {
+                base_threshold: 0.5,
+                ..TaskClassifierConfig::default()
+            },
+        });
+        let algorithm = StageRouter::new(
+            fixed_target("strong", capable.clone()),
+            fixed_target("weak", efficient.clone()),
+            config,
+        )
+        .unwrap();
+        let runtime = runtime_with_algorithm(
+            Arc::new(algorithm),
+            fallback.clone(),
+            WireFormat::OpenAiChat,
+        );
+        let mut marks = Vec::new();
+
+        runtime
+            .execute_buffered(
+                WireFormat::OpenAiChat,
+                request_with_session(WireFormat::OpenAiChat, Some("stage-classifier")),
+                &mut marks,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(judge.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(efficient.calls.load(Ordering::Relaxed), 1);
+        assert_eq!(capable.calls.load(Ordering::Relaxed), 0);
+        assert_eq!(fallback.calls.load(Ordering::Relaxed), 0);
+        assert!(marks.iter().any(|mark| {
+            mark.name == "switchyard.routing.decision"
+                && mark.data["selected_target"] == "weak"
+                && mark.data["routing_tier"] == "weak"
+        }));
     }
 
     #[test]
