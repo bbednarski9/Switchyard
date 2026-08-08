@@ -7,6 +7,7 @@ use std::sync::Arc;
 use http::Uri;
 use http::header::{HeaderName, HeaderValue};
 use serde::Deserialize;
+use serde_json::Value as Json;
 use switchyard_libsy::{
     Algorithm, ClassifierContractConfig, EscalationJudgeConfig, HandoffNoteConfig,
     LlmClassifierConfig, LlmFallback, LlmTarget, LlmTargetSet, LlmTaskClassifier, PickerMode,
@@ -47,6 +48,8 @@ struct TargetBinding {
     drop_caller_extra_body: bool,
     #[serde(default)]
     header_env: BTreeMap<String, String>,
+    #[serde(default)]
+    extra_body: BTreeMap<String, Json>,
 }
 
 impl TargetBinding {
@@ -124,6 +127,7 @@ impl TargetBinding {
             self.protocol,
             dispatch_url,
             headers,
+            self.extra_body.clone(),
             self.drop_caller_extra_body,
         )
         .map_err(|error| format!("failed to create target HTTP client: {error}"))?;
@@ -599,6 +603,7 @@ mod tests {
             weight: 1.0,
             drop_caller_extra_body: false,
             header_env: BTreeMap::new(),
+            extra_body: BTreeMap::new(),
         }
     }
 
@@ -843,6 +848,16 @@ mod tests {
                 .values()
                 .all(|target| Arc::strong_count(&target.client) >= 2)
         );
+    }
+
+    #[test]
+    fn target_provider_defaults_are_accepted_for_judge_controls() {
+        let mut config = config();
+        config.targets.get_mut("chat").unwrap().extra_body =
+            BTreeMap::from([("think".into(), json!(false))]);
+
+        config.validate().unwrap();
+        config.prepare().unwrap();
     }
 
     #[test]

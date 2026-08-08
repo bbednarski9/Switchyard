@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use serde_json::Value as Json;
 use switchyard_llm_client::{Backend, HttpBackendConfig, ModelConfig, TranslatingLlmClient};
 use switchyard_protocol::{
     Context, Decision, LlmClientError, Request, Response, RoutedLlmClient, WireFormat,
@@ -35,6 +36,7 @@ impl TargetClient {
         target_format: WireFormat,
         dispatch_url: String,
         headers: BTreeMap<String, String>,
+        extra_body: BTreeMap<String, Json>,
         drop_caller_extra_body: bool,
     ) -> Result<Self, LlmClientError> {
         let backend_config = HttpBackendConfig {
@@ -44,7 +46,7 @@ impl TargetClient {
             base_url: dispatch_url,
             api_key: None,
             extra_headers: headers,
-            extra_body: BTreeMap::new(),
+            extra_body,
             // Routing retries belong to the plugin: every retry must start a
             // fresh libsy run and obtain a fresh decision.
             max_retries: 0,
@@ -122,6 +124,7 @@ mod tests {
                 WireFormat::AnthropicMessages => "https://provider.example/v1/messages".into(),
             },
             BTreeMap::new(),
+            BTreeMap::new(),
             false,
         )
         .unwrap()
@@ -175,6 +178,7 @@ mod tests {
             "provider/model".into(),
             WireFormat::OpenAiChat,
             "https://provider.example/v1/chat/completions".into(),
+            BTreeMap::new(),
             BTreeMap::new(),
             true,
         )

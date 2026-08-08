@@ -188,6 +188,12 @@
             "default": false,
             "description": "Drop an intercepted OpenAI SDK extra_body wrapper instead of forwarding it to targets that reject caller-specific extensions."
           },
+          "extra_body": {
+            "type": "object",
+            "default": {},
+            "description": "Non-secret provider request defaults, such as judge reasoning controls. Caller-provided fields take precedence.",
+            "additionalProperties": true
+          },
           "header_env": {
             "type": "object",
             "description": "Sole custom provider-header source. Maps header names to environment-variable names resolved by the plugin process so literal values are never stored in configuration.",
