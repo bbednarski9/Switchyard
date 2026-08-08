@@ -133,6 +133,25 @@ static configuration loading. Same-protocol streaming preserves parsed provider
 events when the router does not aggregate or replace them; raw SSE bytes and
 framing are not part of the compatibility contract.
 
+### Known issue: OpenAI Responses structured-output judges
+
+OpenAI Responses targets are accepted for structured-output judges, but the
+shared Responses request encoder currently emits the Chat-compatible JSON
+Schema object directly under `text.format`. This places `name`, `schema`, and
+`strict` under `text.format.json_schema`; conforming Responses endpoints expect
+those fields directly under `text.format`. InferenceHub therefore returns HTTP
+400 with `Missing required parameter: 'text.format.name'`, and the affected
+router follows its existing judge-failure or fall-open path.
+
+A hosted Relay process run passed 20 of 23 router-matrix cases. The only
+failures were the Responses-judge variants of the capability classifier,
+escalation router, and stage classifier fallback. OpenAI Responses remains
+verified as a caller and ordinary serving-target protocol. Until the shared
+`switchyard-translation` encoder is corrected, configure structured-output
+judges with `protocol = "openai_chat"`. Follow-up work must add the inverse of
+the existing Responses-to-neutral schema conversion plus core and
+process-level regression coverage for all three affected router paths.
+
 The following integration components have not reached complete compatibility.
 `Not built` identifies missing integration work rather than a hidden or
 best-effort runtime path.
