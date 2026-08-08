@@ -199,6 +199,11 @@ then drops the wrapper and its contents; it does not promote those values to
 top-level provider fields. The default is `false` so lossless same-format
 forwarding remains unchanged for targets that consume the extension.
 
+`extra_body` supplies non-secret provider defaults for a target. It is useful
+for provider-specific controls such as disabling reasoning on a dedicated
+judge model. Fields already present on the caller's request take precedence.
+Do not put credentials in `extra_body`; use `header_env` for secrets.
+
 For `kind = "llm_classifier"`, the classifier target must use `openai_chat` or
 `openai_responses`; libsy's judge request uses a JSON-schema response format
 that cannot be represented losslessly by Anthropic Messages. Omitting `mode`
@@ -227,6 +232,25 @@ window_message_chars = 500
 `plugins.dynamic.config.targets`, configured with the same model, protocol,
 URL, and `header_env` fields shown above. The judge must use `openai_chat` or
 `openai_responses`; the serving targets may use any supported protocol.
+
+Use a dedicated, non-reasoning model for the judge when possible. Providers
+that expose a reasoning switch can configure it on that target, for example:
+
+```toml
+[plugins.dynamic.config.targets.judge]
+model = "provider/non-reasoning-judge"
+protocol = "openai_chat"
+base_url = "https://provider.example.com"
+extra_body = { think = false }
+```
+
+The packaged escalation rubric is intentionally detailed and can consume
+roughly two thousand or more input tokens depending on the tokenizer. Every
+unlatched request also pays for a complete judge call. A custom `prompt` can
+reduce that cost, but should be evaluated against representative trajectories
+before deployment. Reasoning models may spend `max_output_tokens` on hidden or
+visible reasoning before returning the structured verdict; disable reasoning
+with provider-supported `extra_body` controls or raise the cap after measuring.
 
 An unlatched streaming escalation request is intentionally buffered. Libsy must
 read the complete weak response before asking the judge, so caller first-token
@@ -274,6 +298,12 @@ OpenAI Responses, and Anthropic Messages traffic. When the signals do not cross
 cannot decide, the configured picker's default tier serves the turn. The
 classifier target has the same structured-output protocol restriction as the
 standalone classifier.
+
+Ambiguous turns that reach the optional classifier add one judge call;
+decisive tool signals do not. Decision marks include `routing_tier` for signal,
+classifier, and picker-default paths, plus `decision_source` (`override`,
+`tests_passed`, `dimensions`, `llm-classifier`, or `fall_open`) for stage-router
+explainability.
 
 Version-1 service configuration, decision-only execution, and observe-only
 mode are rejected.

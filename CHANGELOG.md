@@ -39,6 +39,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **NeMo Relay stage and escalation integration** — preserved same-protocol
+  request bodies are now re-encoded after tier prompts or handoff notes mutate
+  the normalized request; Relay's synthetic `gateway-gateway` identity no
+  longer shares escalation latch state across unrelated raw gateway requests;
+  stage decision marks now retain picker-default tiers, decision sources, and
+  hard-override confidence. Target bindings also accept non-secret
+  `extra_body` defaults for provider-specific judge controls.
+
 - **Response `model` now names the model that actually served the request**, on
   every serving path and wire format. Streamed Anthropic and Responses replies,
   and every libsy-served reply, previously echoed the model id the client
