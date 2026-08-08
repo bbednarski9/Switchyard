@@ -55,6 +55,14 @@ pub struct FallThroughDecision {
     /// Human-readable explanation of the selection.
     pub reasoning: String,
     tier: Option<&'static str>,
+    decision_source: Option<String>,
+}
+
+impl FallThroughDecision {
+    /// Cascade member that resolved the turn, when the assembled router records one.
+    pub fn decision_source(&self) -> Option<&str> {
+        self.decision_source.as_deref()
+    }
 }
 
 impl Decision for FallThroughDecision {
@@ -119,6 +127,7 @@ impl<S: Send> Classifier<S> for DefaultTarget {
 pub struct FallThrough<S = ()> {
     name: String,
     decision_reason: fn(&str, &Score) -> String,
+    decision_source: fn(&S) -> Option<String>,
     processors: Vec<Arc<dyn Processor<S>>>,
     classifiers: Vec<Arc<dyn Classifier<S>>>,
     targets: LlmTargetSet,
@@ -133,6 +142,7 @@ impl FallThrough<()> {
         Self {
             name: "fall_through".to_string(),
             decision_reason: default_decision_reason,
+            decision_source: no_decision_source,
             processors: Vec::new(),
             classifiers: Vec::new(),
             targets,
@@ -152,6 +162,7 @@ where
         Self {
             name: "fall_through".to_string(),
             decision_reason: default_decision_reason,
+            decision_source: no_decision_source,
             processors: Vec::new(),
             classifiers: Vec::new(),
             targets,
@@ -170,6 +181,12 @@ where
     /// Sets the decision reasoning for an algorithm assembled from this cascade.
     pub(crate) fn with_decision_reason(mut self, reason: fn(&str, &Score) -> String) -> Self {
         self.decision_reason = reason;
+        self
+    }
+
+    /// Extracts an assembled router's decision source from its composition state.
+    pub(crate) fn with_decision_source(mut self, source: fn(&S) -> Option<String>) -> Self {
+        self.decision_source = source;
         self
     }
 
@@ -286,6 +303,7 @@ where
                 .classifiers
                 .iter()
                 .find_map(|c| c.routing_tier(&to.semantic_name)),
+            decision_source: None,
         })
     }
 
@@ -352,6 +370,7 @@ where
             selected_model: target.semantic_name.clone(),
             reasoning,
             tier: deciding.and_then(|c| c.routing_tier(&target.semantic_name)),
+            decision_source: (self.decision_source)(state),
         });
         driver.info(ctx.clone(), decision.clone()).await?;
 
@@ -409,6 +428,10 @@ fn default_decision_reason(_name: &str, winner: &Score) -> String {
         "fall-through selected {} (confidence {:.3})",
         winner.target, winner.confidence
     )
+}
+
+fn no_decision_source<S>(_state: &S) -> Option<String> {
+    None
 }
 
 #[async_trait]

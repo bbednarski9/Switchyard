@@ -41,12 +41,15 @@ const STAGE_ROUTER: &str = "stage_router";
 struct SourceStamp {
     inner: Arc<dyn Classifier<State>>,
     source: DecisionSource,
+    targets: StageTargets,
 }
 
 #[async_trait]
 impl Classifier<State> for SourceStamp {
     fn routing_tier(&self, selected_model: &str) -> Option<&'static str> {
-        self.inner.routing_tier(selected_model)
+        self.inner
+            .routing_tier(selected_model)
+            .or_else(|| self.targets.label_for(selected_model))
     }
 
     async fn score(
@@ -176,7 +179,8 @@ fn build_route(
     // classifier is a constant rather than a per-turn lookup.
     let fall_open = targets.name(config.mode.default_tier()).to_string();
 
-    let mut classifier = StageClassifier::new(targets, config.mode, config.confidence_threshold);
+    let mut classifier =
+        StageClassifier::new(targets.clone(), config.mode, config.confidence_threshold);
     if let Some(notes) = config.handoff_notes {
         classifier = classifier.with_handoff_notes(notes);
     }
@@ -187,6 +191,7 @@ fn build_route(
     let target_set = LlmTargetSet::new(vec![capable.clone(), efficient.clone()]);
     let mut router = FallThrough::<State>::new_with_state(target_set)
         .with_name(STAGE_ROUTER)
+        .with_decision_source(decision_source)
         .with_processor(Arc::new(signals))
         .with_classifier(Arc::new(classifier));
     if let Some(fallback) = config.llm_fallback {
@@ -200,6 +205,7 @@ fn build_route(
                 config: fallback.config,
             })?),
             source: DecisionSource::LlmClassifier,
+            targets: targets.clone(),
         }));
     }
     // Nothing behind this, so the turn lands on the picker's default tier —
@@ -207,12 +213,20 @@ fn build_route(
     router = router.with_classifier(Arc::new(SourceStamp {
         inner: Arc::new(DefaultTarget::new(fall_open)),
         source: DecisionSource::FallOpen,
+        targets,
     }));
     // Runs on the post-decision hook, so it applies to the target the cascade
     // settled on, whichever classifier picked it. With no prompts configured it
     // is a no-op, so there is nothing to branch on.
     router = router.with_processor(Arc::new(SystemPromptProcessor::new(config.tier_prompts)));
     Ok(router)
+}
+
+fn decision_source(state: &State) -> Option<String> {
+    match state.extra.get(super::util::stage::DECISION_SOURCE_KEY) {
+        Some(crate::core::state::StateValue::String(source)) => Some(source.clone()),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -282,6 +296,7 @@ mod tests {
         let stamp = SourceStamp {
             inner,
             source: DecisionSource::LlmClassifier,
+            targets: StageTargets::new("strong", "weak"),
         };
         let mut state = State::default();
         stamp

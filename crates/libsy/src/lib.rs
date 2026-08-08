@@ -17,6 +17,7 @@ mod error;
 pub use error::{DriverError, LibsyError, Result};
 
 mod algorithms;
+pub use algorithms::fall_through::FallThroughDecision;
 pub use algorithms::llm_class::{
     CustomClassifierConfig, CustomClassifierPolicy, LlmClassifierConfig, LlmTaskClassifier,
     TaskClassifierConfig,

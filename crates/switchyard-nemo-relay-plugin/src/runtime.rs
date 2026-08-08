@@ -8,7 +8,7 @@ use std::time::Duration;
 use futures_util::{StreamExt, stream};
 use nemo_relay_plugin::{Json, LlmRequest as RelayRequest};
 use serde_json::{Map, json};
-use switchyard_libsy::{Algorithm, CallLlmRequest, LibsyError, Step};
+use switchyard_libsy::{Algorithm, CallLlmRequest, FallThroughDecision, LibsyError, Step};
 use switchyard_protocol::{
     Context, Decision, LlmClientError, LlmResponse, Metadata, Request, Response, SimpleDecision,
     WireFormat,
@@ -68,6 +68,15 @@ impl SwitchyardRuntime {
         llm_request.stream = streaming;
         let headers = string_headers(&request.headers);
         let mut metadata = Metadata::from_headers(&headers);
+        let relay_gateway_placeholder = !headers.contains_key("x-switchyard-session-id")
+            && headers
+                .get("x-nemo-relay-source")
+                .and_then(|value| value.to_str().ok())
+                == Some("gateway")
+            && metadata.session_id.as_deref() == Some("gateway-gateway");
+        if relay_gateway_placeholder {
+            metadata.session_id = None;
+        }
         // Keep identity/routing metadata, but target clients deliberately clear
         // these caller headers before HTTP dispatch.
         metadata.http_headers = Some(headers);
@@ -391,6 +400,10 @@ impl SwitchyardRuntime {
         attempt: u32,
         metadata: &Json,
     ) {
+        let decision_source = decision
+            .as_any()
+            .downcast_ref::<FallThroughDecision>()
+            .and_then(FallThroughDecision::decision_source);
         self.mark(
             marks,
             "switchyard.routing.decision",
@@ -400,6 +413,7 @@ impl SwitchyardRuntime {
                 "selected_target": decision.selected_model(),
                 "reasoning": decision.reasoning(),
                 "routing_tier": decision.routing_tier(),
+                "decision_source": decision_source,
                 "is_routed_call": decision.is_routed_call(),
             }),
             metadata,
@@ -827,6 +841,75 @@ mod tests {
         }
     }
 
+    #[test]
+    fn relay_gateway_placeholder_session_is_not_retained() {
+        let fallback = Arc::new(FixedClient {
+            behavior: FixedBehavior::Text("fallback"),
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = runtime_with_algorithm(
+            Arc::new(Passthrough::new(LlmTarget {
+                semantic_name: "selected".into(),
+                llm_client: None,
+            })),
+            fallback,
+            WireFormat::OpenAiChat,
+        );
+        let request = RelayRequest {
+            headers: Map::from_iter([
+                ("x-nemo-relay-source".into(), json!("gateway")),
+                ("x-nemo-relay-session-id".into(), json!("gateway-gateway")),
+                ("x-dynamo-session-id".into(), json!("gateway-gateway")),
+            ]),
+            content: json!({
+                "model": "router",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+        };
+
+        let decoded = runtime
+            .decode_request(WireFormat::OpenAiChat, &request, false)
+            .unwrap();
+
+        assert_eq!(decoded.metadata.unwrap().session_id, None);
+    }
+
+    #[test]
+    fn explicit_switchyard_session_overrides_relay_gateway_placeholder() {
+        let fallback = Arc::new(FixedClient {
+            behavior: FixedBehavior::Text("fallback"),
+            calls: AtomicUsize::new(0),
+        });
+        let runtime = runtime_with_algorithm(
+            Arc::new(Passthrough::new(LlmTarget {
+                semantic_name: "selected".into(),
+                llm_client: None,
+            })),
+            fallback,
+            WireFormat::OpenAiChat,
+        );
+        let request = RelayRequest {
+            headers: Map::from_iter([
+                ("x-switchyard-session-id".into(), json!("caller-session")),
+                ("x-nemo-relay-source".into(), json!("gateway")),
+                ("x-nemo-relay-session-id".into(), json!("gateway-gateway")),
+            ]),
+            content: json!({
+                "model": "router",
+                "messages": [{"role": "user", "content": "hello"}]
+            }),
+        };
+
+        let decoded = runtime
+            .decode_request(WireFormat::OpenAiChat, &request, false)
+            .unwrap();
+
+        assert_eq!(
+            decoded.metadata.unwrap().session_id.as_deref(),
+            Some("caller-session")
+        );
+    }
+
     #[tokio::test]
     async fn buffered_finalization_failure_uses_fallback_once() {
         let selected = Arc::new(StreamClient {
@@ -1249,6 +1332,7 @@ mod tests {
                     && mark.data["algorithm"] == "stage_router"
                     && mark.data["selected_target"] == "strong"
                     && mark.data["routing_tier"] == "strong"
+                    && mark.data["decision_source"] == "override"
                     && mark.metadata["session_id"] == format!("stage-{}", protocol.as_str())
             }));
         }
@@ -1294,6 +1378,8 @@ mod tests {
             assert!(marks.iter().any(|mark| {
                 mark.name == "switchyard.routing.decision"
                     && mark.data["selected_target"] == expected
+                    && mark.data["routing_tier"] == expected
+                    && mark.data["decision_source"] == "fall_open"
             }));
         }
     }

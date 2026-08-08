@@ -499,6 +499,7 @@ impl Classifier<State> for StageClassifier {
                 tier,
                 source,
                 score,
+                confidence,
                 ..
             } => {
                 let target = self.targets.name(tier);
@@ -507,7 +508,7 @@ impl Classifier<State> for StageClassifier {
                 // is the only branch whose tier the signals actually chose — an
                 // ambiguous turn is decided further down the cascade.
                 self.apply_handoff_note(request, tier, source);
-                let conf = score.abs();
+                let conf = confidence.unwrap_or_else(|| score.abs());
                 Ok((
                     Classification::Scores(vec![Score {
                         target: target.to_string(),
@@ -643,6 +644,7 @@ mod tests {
             Classification::Scores(scores) => {
                 assert_eq!(scores.len(), 1);
                 assert_eq!(scores[0].target, "strong");
+                assert_eq!(scores[0].confidence, 1.0);
             }
             _ => panic!("expected a definite classification"),
         }

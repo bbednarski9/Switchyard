@@ -41,6 +41,7 @@ pub fn append_note(request: &mut Request, note: &str) {
             .messages
             .push(Message::text(Role::User, note)),
     }
+    request.llm_request.preservation.requests.clear();
 }
 
 /// System prompts keyed by routing target. A target left unset is routed
@@ -104,6 +105,7 @@ impl<S: Send> Processor<S> for SystemPromptProcessor {
                 }],
             },
         );
+        request.llm_request.preservation.requests.clear();
         Ok(())
     }
 }
@@ -111,7 +113,10 @@ impl<S: Send> Processor<S> for SystemPromptProcessor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use switchyard_protocol::{LlmRequest, ToolResult, text_request};
+    use serde_json::json;
+    use switchyard_protocol::{
+        LlmRequest, PreservationMetadata, ToolResult, WireFormat, text_request,
+    };
 
     const NOTE: &str = "recovering from an error";
     const STRONG_PROMPT: &str = "diagnose before you edit";
@@ -126,6 +131,16 @@ mod tests {
             raw_request: None,
             metadata: None,
         }
+    }
+
+    fn preserve_chat_request(request: &mut Request) {
+        request.llm_request.preservation = PreservationMetadata {
+            requests: BTreeMap::from([(
+                WireFormat::OpenAiChat.into(),
+                json!({"model": "route", "messages": [{"role": "user", "content": "hi"}]}),
+            )]),
+            ..PreservationMetadata::default()
+        };
     }
 
     #[test]
@@ -190,6 +205,16 @@ mod tests {
         assert_eq!(trail, vec![format!("fix the build|{NOTE}")]);
     }
 
+    #[test]
+    fn a_note_invalidates_the_preserved_provider_request() {
+        let mut request = request_with(vec![Message::text(Role::User, "fix the build")]);
+        preserve_chat_request(&mut request);
+
+        append_note(&mut request, NOTE);
+
+        assert!(request.llm_request.preservation.requests.is_empty());
+    }
+
     /// A decision routed to `target`.
     struct RoutedTo(&'static str);
     impl switchyard_protocol::Decision for RoutedTo {
@@ -249,6 +274,26 @@ mod tests {
                 vec![expected]
             );
         }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_tier_prompt_invalidates_the_preserved_provider_request() -> Result<()> {
+        let processor = SystemPromptProcessor::new(prompts());
+        let mut request = Request::default();
+        preserve_chat_request(&mut request);
+
+        processor
+            .process(
+                &mut (),
+                Event::Decision {
+                    request: &mut request,
+                    decision: &RoutedTo("strong"),
+                },
+            )
+            .await?;
+
+        assert!(request.llm_request.preservation.requests.is_empty());
         Ok(())
     }
 
