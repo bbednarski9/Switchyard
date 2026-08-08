@@ -8,8 +8,9 @@ use http::Uri;
 use http::header::{HeaderName, HeaderValue};
 use serde::Deserialize;
 use switchyard_libsy::{
-    Algorithm, LlmClassifierConfig, LlmTarget, LlmTargetSet, LlmTaskClassifier, Random,
-    TaskClassifierConfig,
+    Algorithm, ClassifierContractConfig, EscalationJudgeConfig, HandoffNoteConfig,
+    LlmClassifierConfig, LlmFallback, LlmTarget, LlmTargetSet, LlmTaskClassifier, PickerMode,
+    Random, StageRouter, StageRouterConfig, TargetPrompts, TaskClassifierConfig,
 };
 use switchyard_protocol::{RoutedLlmClient, WireFormat};
 
@@ -145,6 +146,122 @@ impl PreparedTargetBinding {
     }
 }
 
+#[derive(Clone, Copy, Default, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum LlmClassifierMode {
+    #[default]
+    Capability,
+    Escalation,
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LlmClassifierAlgorithmConfig {
+    #[serde(default)]
+    mode: LlmClassifierMode,
+    classifier_target: String,
+    weak_target: String,
+    strong_target: String,
+    #[serde(default)]
+    base_threshold: Option<f64>,
+    #[serde(default)]
+    threshold_step: Option<f64>,
+    #[serde(default)]
+    session_affinity: Option<bool>,
+    #[serde(default)]
+    message_hash_fallback: Option<bool>,
+    #[serde(default)]
+    recent_turn_window: Option<usize>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default = "default_classifier_max_output_tokens")]
+    max_output_tokens: u64,
+    #[serde(default)]
+    escalation: Option<EscalationJudgeConfig>,
+}
+
+impl LlmClassifierAlgorithmConfig {
+    fn capability_config(&self) -> Result<TaskClassifierConfig, String> {
+        if self.escalation.is_some() {
+            return Err(
+                "llm_classifier capability mode does not accept escalation settings".into(),
+            );
+        }
+        let base_threshold = self
+            .base_threshold
+            .ok_or_else(|| "llm_classifier capability mode requires base_threshold".to_string())?;
+        let mut contract = ClassifierContractConfig::default();
+        if let Some(prompt) = &self.prompt {
+            contract = contract.with_prompt(prompt.clone());
+        }
+        Ok(TaskClassifierConfig {
+            base_threshold,
+            threshold_step: self.threshold_step.unwrap_or_default(),
+            session_affinity: self.session_affinity.unwrap_or_default(),
+            message_hash_fallback: self.message_hash_fallback.unwrap_or_default(),
+            recent_turn_window: self.recent_turn_window,
+            contract,
+            max_output_tokens: self.max_output_tokens,
+        })
+    }
+
+    fn escalation_config(
+        &self,
+    ) -> Result<(ClassifierContractConfig, EscalationJudgeConfig), String> {
+        if self.base_threshold.is_some()
+            || self.threshold_step.is_some()
+            || self.session_affinity.is_some()
+            || self.message_hash_fallback.is_some()
+            || self.recent_turn_window.is_some()
+        {
+            return Err(
+                "llm_classifier escalation mode does not accept capability settings".into(),
+            );
+        }
+        let config = self.escalation.clone().ok_or_else(|| {
+            "llm_classifier escalation mode requires escalation settings".to_string()
+        })?;
+        let mut contract = ClassifierContractConfig::default();
+        if let Some(prompt) = &self.prompt {
+            contract = contract.with_prompt(prompt.clone());
+        }
+        Ok((contract, config))
+    }
+}
+
+#[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StageFallbackConfig {
+    target: String,
+    base_threshold: f64,
+    #[serde(default)]
+    threshold_step: f64,
+    #[serde(default)]
+    recent_turn_window: Option<usize>,
+    #[serde(default)]
+    prompt: Option<String>,
+    #[serde(default = "default_classifier_max_output_tokens")]
+    max_output_tokens: u64,
+}
+
+impl StageFallbackConfig {
+    fn classifier_config(&self) -> TaskClassifierConfig {
+        let mut contract = ClassifierContractConfig::default();
+        if let Some(prompt) = &self.prompt {
+            contract = contract.with_prompt(prompt.clone());
+        }
+        TaskClassifierConfig {
+            base_threshold: self.base_threshold,
+            threshold_step: self.threshold_step,
+            session_affinity: false,
+            message_hash_fallback: false,
+            recent_turn_window: self.recent_turn_window,
+            contract,
+            max_output_tokens: self.max_output_tokens,
+        }
+    }
+}
+
 #[derive(Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 enum AlgorithmConfig {
@@ -153,11 +270,24 @@ enum AlgorithmConfig {
         seed: Option<u64>,
     },
     LlmClassifier {
-        classifier_target: String,
-        weak_target: String,
-        strong_target: String,
         #[serde(flatten)]
-        config: TaskClassifierConfig,
+        config: LlmClassifierAlgorithmConfig,
+    },
+    StageRouter {
+        capable_target: String,
+        efficient_target: String,
+        picker: PickerMode,
+        confidence_threshold: f64,
+        #[serde(default)]
+        recent_turn_window: Option<usize>,
+        #[serde(default)]
+        capable_system_prompt: Option<String>,
+        #[serde(default)]
+        efficient_system_prompt: Option<String>,
+        #[serde(default)]
+        handoff_notes: Option<HandoffNoteConfig>,
+        #[serde(default)]
+        classifier: Option<StageFallbackConfig>,
     },
 }
 
@@ -284,30 +414,80 @@ impl SwitchyardConfig {
                     .map(|algorithm| Arc::new(algorithm) as Arc<dyn Algorithm>)
                     .map_err(|error| error.to_string())
             }
-            AlgorithmConfig::LlmClassifier {
-                classifier_target,
-                weak_target,
-                strong_target,
-                config,
+            AlgorithmConfig::LlmClassifier { config } => {
+                self.validate_judge_target(&config.classifier_target)?;
+                let algorithm = match config.mode {
+                    LlmClassifierMode::Capability => LlmClassifierConfig::Capability {
+                        judge_target: target(&config.classifier_target)?,
+                        efficient_target: target(&config.weak_target)?,
+                        capable_target: target(&config.strong_target)?,
+                        config: config.capability_config()?,
+                    },
+                    LlmClassifierMode::Escalation => {
+                        let (contract, escalation) = config.escalation_config()?;
+                        LlmClassifierConfig::Escalation {
+                            judge_target: target(&config.classifier_target)?,
+                            efficient_target: target(&config.weak_target)?,
+                            capable_target: target(&config.strong_target)?,
+                            contract,
+                            config: escalation,
+                            max_output_tokens: config.max_output_tokens,
+                        }
+                    }
+                };
+                LlmTaskClassifier::new(algorithm)
+                    .map(|algorithm| Arc::new(algorithm) as Arc<dyn Algorithm>)
+                    .map_err(|error| error.to_string())
+            }
+            AlgorithmConfig::StageRouter {
+                capable_target,
+                efficient_target,
+                picker,
+                confidence_threshold,
+                recent_turn_window,
+                capable_system_prompt,
+                efficient_system_prompt,
+                handoff_notes,
+                classifier,
             } => {
-                let classifier_binding = self.targets.get(classifier_target).ok_or_else(|| {
-                    format!("algorithm target {classifier_target:?} is not configured")
-                })?;
-                if classifier_binding.protocol == WireFormat::AnthropicMessages {
-                    return Err(format!(
-                        "classifier target {classifier_target:?} uses anthropic_messages, which cannot encode the required JSON-schema response format without loss; use an openai_chat or openai_responses target"
-                    ));
+                let capable = target(capable_target)?;
+                let efficient = target(efficient_target)?;
+                let mut config = StageRouterConfig::new(*picker, *confidence_threshold);
+                config.recent_window = *recent_turn_window;
+                config.handoff_notes = handoff_notes.clone();
+                let mut prompts = TargetPrompts::default();
+                if let Some(prompt) = capable_system_prompt {
+                    prompts = prompts.with(capable_target, prompt);
                 }
-                LlmTaskClassifier::new(LlmClassifierConfig::Capability {
-                    judge_target: target(classifier_target)?,
-                    efficient_target: target(weak_target)?,
-                    capable_target: target(strong_target)?,
-                    config: config.clone(),
-                })
-                .map(|algorithm| Arc::new(algorithm) as Arc<dyn Algorithm>)
-                .map_err(|error| error.to_string())
+                if let Some(prompt) = efficient_system_prompt {
+                    prompts = prompts.with(efficient_target, prompt);
+                }
+                config.tier_prompts = prompts;
+                if let Some(classifier) = classifier {
+                    self.validate_judge_target(&classifier.target)?;
+                    config.llm_fallback = Some(LlmFallback {
+                        judge_target: target(&classifier.target)?,
+                        config: classifier.classifier_config(),
+                    });
+                }
+                StageRouter::new(capable, efficient, config)
+                    .map(|algorithm| Arc::new(algorithm) as Arc<dyn Algorithm>)
+                    .map_err(|error| error.to_string())
             }
         }
+    }
+
+    fn validate_judge_target(&self, name: &str) -> Result<(), String> {
+        let binding = self
+            .targets
+            .get(name)
+            .ok_or_else(|| format!("algorithm target {name:?} is not configured"))?;
+        if binding.protocol == WireFormat::AnthropicMessages {
+            return Err(format!(
+                "classifier target {name:?} uses anthropic_messages, which cannot encode the required JSON-schema response format without loss; use an openai_chat or openai_responses target"
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -401,10 +581,14 @@ const fn default_weight() -> f64 {
     1.0
 }
 
+fn default_classifier_max_output_tokens() -> u64 {
+    TaskClassifierConfig::default().max_output_tokens
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     fn binding(protocol: WireFormat, model: &str) -> TargetBinding {
         TargetBinding {
@@ -664,15 +848,14 @@ mod tests {
     #[test]
     fn classifier_rejects_anthropic_judge_targets_before_dispatch() {
         let mut config = config();
-        config.algorithm = AlgorithmConfig::LlmClassifier {
-            classifier_target: "anthropic".into(),
-            weak_target: "responses".into(),
-            strong_target: "chat".into(),
-            config: TaskClassifierConfig {
-                base_threshold: 0.5,
-                ..Default::default()
-            },
-        };
+        config.algorithm = serde_json::from_value(json!({
+            "kind": "llm_classifier",
+            "classifier_target": "anthropic",
+            "weak_target": "responses",
+            "strong_target": "chat",
+            "base_threshold": 0.5
+        }))
+        .unwrap();
 
         let error = config.validate().unwrap_err();
         assert!(error.contains("classifier target \"anthropic\" uses anthropic_messages"));
@@ -720,20 +903,218 @@ mod tests {
         );
 
         let mut classifier = config();
-        classifier.algorithm = AlgorithmConfig::LlmClassifier {
-            classifier_target: "chat".into(),
-            weak_target: "responses".into(),
-            strong_target: "anthropic".into(),
-            config: TaskClassifierConfig {
-                base_threshold: 1.1,
-                ..Default::default()
-            },
-        };
+        classifier.algorithm = serde_json::from_value(json!({
+            "kind": "llm_classifier",
+            "classifier_target": "chat",
+            "weak_target": "responses",
+            "strong_target": "anthropic",
+            "base_threshold": 1.1
+        }))
+        .unwrap();
         assert!(
             classifier
                 .validate()
                 .unwrap_err()
                 .contains("base_threshold must be between 0 and 1")
+        );
+    }
+
+    #[test]
+    fn escalation_classifier_builds_with_defaulted_policy_settings() {
+        let mut config = config();
+        config.algorithm = serde_json::from_value(json!({
+            "kind": "llm_classifier",
+            "mode": "escalation",
+            "classifier_target": "chat",
+            "weak_target": "responses",
+            "strong_target": "anthropic",
+            "prompt": "Judge the completed trajectory.",
+            "max_output_tokens": 256,
+            "escalation": {}
+        }))
+        .unwrap();
+
+        config.validate().unwrap();
+        let prepared = config.prepare().unwrap();
+        assert_eq!(prepared.algorithm.name(), "llm_task_classifier");
+        assert!(
+            prepared
+                .targets
+                .values()
+                .all(|target| Arc::strong_count(&target.client) >= 2)
+        );
+    }
+
+    #[test]
+    fn classifier_modes_reject_mixed_or_missing_settings() {
+        let mut capability = config();
+        capability.algorithm = serde_json::from_value(json!({
+            "kind": "llm_classifier",
+            "classifier_target": "chat",
+            "weak_target": "responses",
+            "strong_target": "anthropic",
+            "base_threshold": 0.5,
+            "escalation": {}
+        }))
+        .unwrap();
+        assert!(
+            capability
+                .validate()
+                .unwrap_err()
+                .contains("capability mode does not accept escalation")
+        );
+
+        let mut escalation = config();
+        escalation.algorithm = serde_json::from_value(json!({
+            "kind": "llm_classifier",
+            "mode": "escalation",
+            "classifier_target": "chat",
+            "weak_target": "responses",
+            "strong_target": "anthropic",
+            "base_threshold": 0.5,
+            "escalation": {}
+        }))
+        .unwrap();
+        assert!(
+            escalation
+                .validate()
+                .unwrap_err()
+                .contains("escalation mode does not accept capability")
+        );
+
+        let mut missing = config();
+        missing.algorithm = serde_json::from_value(json!({
+            "kind": "llm_classifier",
+            "mode": "escalation",
+            "classifier_target": "chat",
+            "weak_target": "responses",
+            "strong_target": "anthropic"
+        }))
+        .unwrap();
+        assert!(
+            missing
+                .validate()
+                .unwrap_err()
+                .contains("requires escalation settings")
+        );
+    }
+
+    #[test]
+    fn escalation_settings_are_validated_by_the_libsy_constructor() {
+        for (settings, expected) in [
+            (
+                json!({"confirmations": 0}),
+                "confirmations must be at least 1",
+            ),
+            (
+                json!({"recent_turn_window": 0}),
+                "recent_turn_window must be at least 1",
+            ),
+            (
+                json!({"window_message_chars": 49}),
+                "window_message_chars must be at least 50",
+            ),
+        ] {
+            let mut config = config();
+            config.algorithm = serde_json::from_value(json!({
+                "kind": "llm_classifier",
+                "mode": "escalation",
+                "classifier_target": "chat",
+                "weak_target": "responses",
+                "strong_target": "anthropic",
+                "escalation": settings
+            }))
+            .unwrap();
+            assert!(config.validate().unwrap_err().contains(expected));
+        }
+    }
+
+    #[test]
+    fn full_stage_router_configuration_builds_all_clients() {
+        let mut config = config();
+        config.algorithm = serde_json::from_value(json!({
+            "kind": "stage_router",
+            "capable_target": "anthropic",
+            "efficient_target": "responses",
+            "picker": "efficient_first",
+            "confidence_threshold": 0.5,
+            "recent_turn_window": 3,
+            "capable_system_prompt": "Diagnose before editing.",
+            "efficient_system_prompt": "Follow the settled plan.",
+            "handoff_notes": {
+                "escalation_note": "The previous model was stalling.",
+                "deescalation_note": "The task is settled.",
+                "only_on_wrong_signal_escalation": true
+            },
+            "classifier": {
+                "target": "chat",
+                "base_threshold": 0.5,
+                "threshold_step": 0.1,
+                "recent_turn_window": 3,
+                "prompt": "Can the efficient tier finish this turn?",
+                "max_output_tokens": 256
+            }
+        }))
+        .unwrap();
+
+        config.validate().unwrap();
+        let prepared = config.prepare().unwrap();
+        assert_eq!(prepared.algorithm.name(), "stage_router");
+        assert!(
+            prepared
+                .targets
+                .values()
+                .all(|target| Arc::strong_count(&target.client) >= 2)
+        );
+    }
+
+    #[test]
+    fn stage_router_validates_threshold_targets_and_judge_protocol() {
+        let stage = |classifier: Value, threshold: f64| {
+            serde_json::from_value(json!({
+                "kind": "stage_router",
+                "capable_target": "anthropic",
+                "efficient_target": "responses",
+                "picker": "capable_first",
+                "confidence_threshold": threshold,
+                "classifier": classifier
+            }))
+            .unwrap()
+        };
+
+        let mut invalid_threshold = config();
+        invalid_threshold.algorithm = stage(Value::Null, 1.1);
+        assert!(
+            invalid_threshold
+                .validate()
+                .unwrap_err()
+                .contains("confidence_threshold must be between 0 and 1")
+        );
+
+        let mut missing_target = config();
+        missing_target.algorithm = serde_json::from_value(json!({
+            "kind": "stage_router",
+            "capable_target": "missing",
+            "efficient_target": "responses",
+            "picker": "capable_first",
+            "confidence_threshold": 0.5
+        }))
+        .unwrap();
+        assert!(
+            missing_target
+                .validate()
+                .unwrap_err()
+                .contains("algorithm target \"missing\" is not configured")
+        );
+
+        let mut anthropic_judge = config();
+        anthropic_judge.algorithm =
+            stage(json!({"target": "anthropic", "base_threshold": 0.5}), 0.5);
+        assert!(
+            anthropic_judge
+                .validate()
+                .unwrap_err()
+                .contains("classifier target \"anthropic\" uses anthropic_messages")
         );
     }
 
