@@ -108,6 +108,52 @@ The plugin supports four libsy routing modes:
 
 Unsupported algorithm kinds are rejected instead of being approximated.
 
+## Compatibility Matrix
+
+The following matrix describes the algorithm behavior implemented by the
+plugin. `Conditional` means that the feature is implemented with the constraint
+shown in the table; it does not mean that the feature falls back to a different
+algorithm.
+
+| Compatibility Area | `random` | `llm_classifier` (`capability`) | `llm_classifier` (`escalation`) | `stage_router` |
+|---|---|---|---|---|
+| Version-2 configuration and static validation | Supported | Supported | Supported | Supported |
+| Caller protocols | OpenAI Chat, OpenAI Responses, Anthropic Messages | OpenAI Chat, OpenAI Responses, Anthropic Messages | OpenAI Chat, OpenAI Responses, Anthropic Messages | OpenAI Chat, OpenAI Responses, Anthropic Messages |
+| Serving-target protocols | OpenAI Chat, OpenAI Responses, Anthropic Messages | OpenAI Chat, OpenAI Responses, Anthropic Messages | OpenAI Chat, OpenAI Responses, Anthropic Messages | OpenAI Chat, OpenAI Responses, Anthropic Messages |
+| Structured-output judge protocols | Not applicable | OpenAI Chat or OpenAI Responses | OpenAI Chat or OpenAI Responses | OpenAI Chat or OpenAI Responses for the optional classifier |
+| Buffered responses | Supported | Supported | Supported | Supported |
+| Streaming responses | Supported | Supported after the judge selects a target | Conditional: an unlatched weak stream is aggregated before the judge runs | Supported after the signal cascade selects a target |
+| Retained routing state | No selection affinity; context-overflow eviction can use session identity | Optional session affinity and message-hash fallback | Confirmation streak and strong latch require stable session identity | No classifier affinity; context-overflow eviction can use session identity |
+| Router-specific prompts | Not applicable | Optional judge prompt | Optional escalation-judge prompt | Optional tier prompts, handoff notes, and classifier prompt |
+| Relay decision marks | Algorithm, attempt, selected target, and identity; routing tier is `null` | Algorithm, attempt, selected target, weak or strong routing tier, and identity | Algorithm, attempt, selected target, weak or strong routing tier, and identity | Algorithm, attempt, selected target, routing tier, decision source, and identity |
+
+Anthropic Messages is supported for callers and serving targets, but not for a
+structured-output judge. That restriction is intentional and fails during
+static configuration loading. Same-protocol streaming preserves parsed provider
+events when the router does not aggregate or replace them; raw SSE bytes and
+framing are not part of the compatibility contract.
+
+The following integration components have not reached complete compatibility.
+`Not built` identifies missing integration work rather than a hidden or
+best-effort runtime path.
+
+| Compatibility Component | Status | Current Boundary |
+|---|---|---|
+| Pinned Relay process-level acceptance harness | Not built | Unit and workspace tests run in CI. Relay 0.7.1 plus Ollama smoke coverage is manual and currently covers OpenAI Chat paths for escalation and stage routing. |
+| OpenAI Responses and Anthropic Messages process-level routing matrix | Not built | Translation and in-process runtime coverage exists, including stage signals across all three caller protocols, but no automated Relay gateway matrix exercises every algorithm and target combination. |
+| Real coding-agent acceptance harness | Not built | Codex, Claude Code, and Hermes sessions are not driven automatically through the packaged plugin. |
+| Hosted-provider certification | Not built | No automated suite qualifies structured-output judges, serving targets, latency, or token cost against hosted provider APIs. |
+| Native bundle platform and Relay-version matrix | Partial | The workspace builds in Linux CI and the plugin was smoked manually on macOS arm64 with Relay 0.7.1. Dedicated packaged-plugin jobs do not yet cover Linux and Windows bundles or every supported Relay 0.7 release. |
+| Dynamic-plugin lifecycle automation | Partial | Manifest validation, registration, enablement, execution, and unload were exercised manually; they are not part of a repeatable CI acceptance test. |
+| Nested Relay lifecycle telemetry for managed provider calls | Not built | Relay records the outer call and Switchyard routing marks. Switchyard provider HTTP spans are not bridged into nested Relay LLM events. |
+| Provider `Retry-After` propagation | Not built | The outer routing loop uses bounded exponential backoff because the client error contract does not expose `Retry-After`. |
+| Cross-protocol streaming loss diagnostics | Not built | Cross-protocol streams use normalized chunks, but the stream adapter does not surface the buffered translation engine's reject-lossy diagnostics. |
+| Safe typed Relay asynchronous host adapter | Blocked on host API | The plugin uses its tested raw C ownership adapter until Relay exposes an equivalent safe asynchronous Rust facade. |
+
+Managed inner provider calls also do not re-enter Relay's downstream provider
+middleware. This behavior is part of the current ownership boundary, not an
+automatic compatibility fallback.
+
 The plugin owns the outer routing retry loop. Each retry starts a fresh libsy
 run. Random routing draws again; an algorithm configured with persistent state,
 such as classifier session affinity, may intentionally retain its assignment.
