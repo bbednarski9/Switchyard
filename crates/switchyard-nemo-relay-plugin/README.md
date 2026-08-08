@@ -95,13 +95,17 @@ when Relay exposes equivalent asynchronous callbacks and cancellation.
 
 ## Supported routers
 
-This initial plugin supports exactly two libsy algorithms:
+The plugin supports four libsy routing modes:
 
 - seeded, weighted `random` routing; and
 - capability-based `llm_classifier` routing, where a judge selects the weak or
-  strong target before the final provider call.
+  strong target before the final provider call;
+- escalation-mode `llm_classifier` routing, where a judge evaluates the weak
+  model's completed turn and latches a session to the strong target after a
+  configured confirmation streak; and
+- signal-driven `stage_router` routing, with optional handoff notes, tier
+  prompts, and a capability-classifier fallback for ambiguous turns.
 
-`stage_router` and response-judging escalation are intentionally deferred.
 Unsupported algorithm kinds are rejected instead of being approximated.
 
 The plugin owns the outer routing retry loop. Each retry starts a fresh libsy
@@ -197,8 +201,79 @@ forwarding remains unchanged for targets that consume the extension.
 
 For `kind = "llm_classifier"`, the classifier target must use `openai_chat` or
 `openai_responses`; libsy's judge request uses a JSON-schema response format
-that cannot be represented losslessly by Anthropic Messages. The remaining
-classifier fields map directly to libsy's capability classifier configuration.
+that cannot be represented losslessly by Anthropic Messages. Omitting `mode`
+selects `capability`, preserving the original version-2 configuration shape.
+
+Escalation mode evaluates the weak model's completed response before returning
+it or replacing it with a strong-model response:
+
+```toml
+[plugins.dynamic.config.algorithm]
+kind = "llm_classifier"
+mode = "escalation"
+classifier_target = "judge"
+weak_target = "weak"
+strong_target = "strong"
+prompt = "Judge whether the weak model is stuck."
+max_output_tokens = 512
+
+[plugins.dynamic.config.algorithm.escalation]
+confirmations = 2
+recent_turn_window = 28
+window_message_chars = 500
+```
+
+`judge`, `weak`, and `strong` are keys in
+`plugins.dynamic.config.targets`, configured with the same model, protocol,
+URL, and `header_env` fields shown above. The judge must use `openai_chat` or
+`openai_responses`; the serving targets may use any supported protocol.
+
+An unlatched streaming escalation request is intentionally buffered. Libsy must
+read the complete weak response before asking the judge, so caller first-token
+delivery waits for the weak call and judge verdict. A declined escalation is
+reconstructed as a stream from the aggregate response, which drops the
+provider-event preservation envelope. A confirmed escalation discards that
+weak response and serves the strong target.
+
+The default `confirmations = 2` retains a streak per Switchyard session. Callers
+must send a stable `x-switchyard-session-id` header for the streak and strong
+latch to survive across turns. Without session identity each request has
+isolated state and a multi-confirmation escalation cannot latch.
+
+A full stage router can combine tool-result signals, model-specific prompts,
+handoff notes, and an optional judge for ambiguous turns:
+
+```toml
+[plugins.dynamic.config.algorithm]
+kind = "stage_router"
+capable_target = "strong"
+efficient_target = "weak"
+picker = "efficient_first"
+confidence_threshold = 0.5
+recent_turn_window = 3
+capable_system_prompt = "Diagnose before editing."
+efficient_system_prompt = "Follow the settled plan."
+
+[plugins.dynamic.config.algorithm.handoff_notes]
+escalation_note = "The previous model was stalling; pick up the diagnosis."
+deescalation_note = "The task is settled; continue with the mechanical work."
+only_on_wrong_signal_escalation = true
+
+[plugins.dynamic.config.algorithm.classifier]
+target = "judge"
+base_threshold = 0.5
+threshold_step = 0.1
+recent_turn_window = 3
+prompt = "Estimate whether the efficient target can finish this turn."
+max_output_tokens = 512
+```
+
+Stage routing reads normalized tool calls and tool results from OpenAI Chat,
+OpenAI Responses, and Anthropic Messages traffic. When the signals do not cross
+`confidence_threshold`, the optional classifier decides; if it is absent or
+cannot decide, the configured picker's default tier serves the turn. The
+classifier target has the same structured-output protocol restriction as the
+standalone classifier.
 
 Version-1 service configuration, decision-only execution, and observe-only
 mode are rejected.

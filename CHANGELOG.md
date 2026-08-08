@@ -9,10 +9,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 ### Added
 
 - **NeMo Relay native plugin** — a dynamically loaded integration that runs
-  libsy's weighted-random and LLM-classifier algorithms in process while
-  Switchyard owns provider HTTP dispatch, credentials, translation, retries,
-  and fallback. Managed calls require NeMo Relay 0.7 or newer and do not depend
-  on `switchyard-server`.
+  libsy's weighted-random, LLM-classifier, escalation, and stage-router
+  algorithms in process while Switchyard owns provider HTTP dispatch,
+  credentials, translation, retries, and fallback. Managed calls require NeMo
+  Relay 0.7 or newer and do not depend on `switchyard-server`.
 
 ### Removed
 
